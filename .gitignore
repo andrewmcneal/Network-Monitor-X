@@ -1,0 +1,15 @@
+# Ignore private credentials and host data
+config.csv
+status.csv
+
+# Ignore logs and local tracking markers
+Host-Logs/
+Errors-*.log
+.stats_sent_*
+
+# Ignore experimental or test scripts
+test_alert.py
+
+# Ignore Python system cache
+__pycache__/
+*.py[cod]
