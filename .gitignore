@@ -1,15 +1,15 @@
-# Ignore private credentials and host data
+# Credentials and Local Config
 config.csv
+twitter-config.csv
+hosts-config.csv
+
+# State and Logs
 status.csv
-
-# Ignore logs and local tracking markers
+*.txt
+*.log
 Host-Logs/
-Errors-*.log
-.stats_sent_*
 
-# Ignore experimental or test scripts
-test_alert.py
-
-# Ignore Python system cache
+# Python environment
 __pycache__/
-*.py[cod]
+.venv/
+.DS_Store

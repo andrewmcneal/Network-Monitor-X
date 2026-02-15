@@ -1,219 +1,206 @@
-"""
-Network Monitor with X (Twitter) Alerts
-Created for: Raspberry Pi
-Written by  Andrew McNeal
-Function: Pings multiple hosts, logs results, and alerts via X when thresholds are met.
-"""
-
 import csv
 import os
 import platform
 import subprocess
 from datetime import datetime, timedelta
 import tweepy
+from concurrent.futures import ThreadPoolExecutor
 
-# === 1. INITIAL BOOTSTRAP & PATHING ===
-# We determine the script's physical location to ensure it finds the config 
-# file regardless of where the script is called from (e.g., Cron).
+# ==========================================
+# 1. CORE CONFIGURATION & PATHING
+# ==========================================
+
+# Locate the directory where the script is stored
 SCRIPT_LOCATION = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE_PATH = os.path.join(SCRIPT_LOCATION, 'config.csv')
+GENERAL_CONFIG = os.path.join(SCRIPT_LOCATION, 'config.csv')
+TWITTER_CONFIG = os.path.join(SCRIPT_LOCATION, 'twitter-config.csv')
+HOSTS_CONFIG = os.path.join(SCRIPT_LOCATION, 'hosts-config.csv')
 
-def load_csv_to_dict(filename):
-    """
-    Reads a two-column CSV and converts it into a dictionary for quick lookup.
-    Example: row['IP1'] -> '8.8.8.8'
-    """
+def load_generic_csv(filename):
+    """Loads a 2-column CSV into a dictionary for quick lookups."""
     data = {}
-    if not os.path.exists(filename):
-        return data
-    with open(filename, 'r') as f:
+    if not os.path.exists(filename): return data
+    with open(filename, 'r', encoding='utf-8') as f:
         reader = csv.reader(f)
-        try:
-            next(reader) # Skip the header row
-            for row in reader:
-                if len(row) >= 2:
-                    data[row[0]] = row[1]
-        except StopIteration:
-            pass
+        next(reader, None)  # Skip header
+        for row in reader:
+            if len(row) >= 2: data[row[0]] = row[1]
     return data
 
-def initialize_workspace():
-    """
-    Sets up the environment on the first run. 
-    Creates default config, status files, and the log directory.
-    """
-    # Create default configuration if none exists
-    if not os.path.exists(CONFIG_FILE_PATH):
-        defaults = [
-            ['Field Name', 'Value'],
-            ['BASE_DIR', SCRIPT_LOCATION], # Default to script folder
-            ['X_TAG_ACCOUNTS', ''],        # Empty by default to protect privacy
-            ['IP1', '8.8.8.8'], ['Hostname1', 'Google'], ['Threshold1', '3'],
-            ['IP2', '1.1.1.1'], ['Hostname2', 'Cloudflare'], ['Threshold2', '3'],
-            ['IP3', '192.168.1.1'], ['Hostname3', 'Gateway'], ['Threshold3', '1'],
-            ['IP4', '9.9.9.9'], ['Hostname4', 'Quad9'], ['Threshold4', '5'],
-            ['API_KEY', 'REQUIRED'], ['API_SECRET', 'REQUIRED'],
-            ['ACCESS_TOKEN', 'REQUIRED'], ['ACCESS_TOKEN_SECRET', 'REQUIRED'],
-            ['BEARER_TOKEN', 'REQUIRED']
-        ]
-        with open(CONFIG_FILE_PATH, 'w', newline='') as f:
-            csv.writer(f).writerows(defaults)
+def load_hosts():
+    """Loads all monitoring targets from the hosts configuration file."""
+    if not os.path.exists(HOSTS_CONFIG): return []
+    with open(HOSTS_CONFIG, 'r', encoding='utf-8') as f:
+        return list(csv.DictReader(f))
 
-    # Resolve the working directory from the config
-    cfg = load_csv_to_dict(CONFIG_FILE_PATH)
-    base = cfg.get('BASE_DIR', SCRIPT_LOCATION)
-    
-    # Ensure the folder for raw text logs exists
-    log_dir = os.path.join(base, 'Host-Logs')
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir, exist_ok=True)
+# ==========================================
+# 2. PING & DURATION UTILITIES
+# ==========================================
 
-    # Initialize the status tracker if it's missing
-    status_path = os.path.join(base, 'status.csv')
-    if not os.path.exists(status_path):
-        with open(status_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Field Name', 'Value'])
-            for i in range(1, 5):
-                writer.writerow([f'Status{i}', 'Up'])
-                writer.writerow([f'FailCount{i}', '0'])
-                writer.writerow([f'DateTime{i}', datetime.now().strftime("%m%d%Y-%H%M")])
-
-def log_error(message, base_dir):
-    """Appends unexpected errors to a yearly log file for debugging."""
-    error_log = os.path.join(base_dir, f"Errors-{datetime.now().year}.log")
-    with open(error_log, "a") as f:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.write(f"{timestamp}: {message}\n")
-
-def get_x_client(cfg):
-    """Authenticates with X using credentials provided in config.csv."""
-    return tweepy.Client(
-        bearer_token=cfg.get('BEARER_TOKEN'),
-        consumer_key=cfg.get('API_KEY'),
-        consumer_secret=cfg.get('API_SECRET'),
-        access_token=cfg.get('ACCESS_TOKEN'),
-        access_token_secret=cfg.get('ACCESS_TOKEN_SECRET')
-    )
-
-def post_daily_stats(cfg, base_dir, log_dir):
-    """
-    Summarizes the previous day's uptime/downtime.
-    Uses a marker file to ensure it only posts once per day.
-    """
-    yesterday = (datetime.now() - timedelta(days=1))
-    date_str = yesterday.strftime("%m%d%Y")
-    marker_file = os.path.join(base_dir, f".stats_sent_{date_str}")
-    
-    # Exit if we already sent today's report
-    if os.path.exists(marker_file):
-        return
-
-    tags = cfg.get('X_TAG_ACCOUNTS', '')
-    stats_msg = f"Daily Network Report {tags}\nDate: {yesterday.strftime('%m/%d/%Y')}\n"
-    
-    for i in range(1, 5):
-        host = cfg.get(f'Hostname{i}', f'Host{i}')
-        log_file = os.path.join(log_dir, f"{host}-{date_str}.txt")
-        down_minutes = 0
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                # Count lines containing ": Down" as one minute of downtime
-                down_minutes = sum(1 for line in f if ": Down" in line)
-        stats_msg += f"• {host}: {down_minutes}m down\n"
-
+def ping_individual_host(host_data):
+    """Performs a system ping. Returns (Hostname, Status)."""
+    name, ip = host_data['Hostname'], host_data['IP']
+    # Select correct ping parameter based on Operating System
+    param = '-n' if platform.system().lower() == 'windows' else '-c'
     try:
-        get_x_client(cfg).create_tweet(text=stats_msg[:280])
-        with open(marker_file, "w") as f:
-            f.write(f"Sent at {datetime.now()}")
-    except Exception as e:
-        log_error(f"Daily Report Tweet Failed: {e}", base_dir)
+        # Timeout set to 2 seconds (-W 2) with 1 packet count (-c/n 1)
+        is_up = subprocess.call(['ping', param, '1', '-W', '2', ip], 
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    except: 
+        is_up = False
+    return name, "Up" if is_up else "Down"
+
+def get_duration(start_str, end_dt):
+    """Calculates minutes elapsed between a timestamp string and a datetime object."""
+    try:
+        start_dt = datetime.strptime(start_str, "%m%d%Y-%H%M")
+        diff = end_dt - start_dt
+        return int(diff.total_seconds() // 60)
+    except: 
+        return 0
+
+# ==========================================
+# 3. MAIN MONITORING ENGINE
+# ==========================================
 
 def main():
-    # Setup environment
-    initialize_workspace()
-
-    # Load validated settings and paths
-    config = load_csv_to_dict(CONFIG_FILE_PATH)
-    base = config.get('BASE_DIR', SCRIPT_LOCATION)
+    # Load settings and host list
+    gen_cfg = load_generic_csv(GENERAL_CONFIG)
+    tw_cfg = load_generic_csv(TWITTER_CONFIG)
+    hosts = load_hosts()
+    
+    # Resolve working directories
+    base = os.path.expanduser(gen_cfg.get('BASE_DIR', SCRIPT_LOCATION))
     status_path = os.path.join(base, 'status.csv')
     log_dir = os.path.join(base, 'Host-Logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Load current state and current time
+    status_vals = load_generic_csv(status_path)
+    now = datetime.now()
+    today_str = now.strftime("%m%d%Y")
+    timestamp = now.strftime("%m%d%Y-%H%M")
+    
+    # Error logs live in the root folder as Errors-YYYY.txt
+    error_file = os.path.join(base, f"Errors-{now.strftime('%Y')}.txt")
+    
+    # ------------------------------------------
+    # A. DAILY SUMMARY GENERATION
+    # ------------------------------------------
+    report_time_cfg = gen_cfg.get('REPORT_TIME', '00:00')
+    current_time_str = now.strftime("%H:%M")
+    last_report_date = status_vals.get('LastDailyReportDate', '')
 
-    try:
-        status_vals = load_csv_to_dict(status_path)
-        now = datetime.now()
-        date_str = now.strftime("%m%d%Y")
-        timestamp = f"{date_str}-{now.strftime('%H%M')}"
+    daily_report_msg = ""
+    # Trigger report if current time is past scheduled time and not sent today
+    if last_report_date != today_str and current_time_str >= report_time_cfg:
+        daily_report_msg = f"📊 Daily Network Summary ({now.strftime('%m/%d/%Y')})\n"
+        isp_count = int(status_vals.get('DailyISPOutages', '0'))
+        for h in hosts:
+            name = h['Hostname']
+            mins = status_vals.get(f'DailyDowntime_{name}', '0')
+            daily_report_msg += f"• {name}: {mins}m down\n"
+        if isp_count > 0: 
+            daily_report_msg += f"• ISP Outages: {isp_count}"
         
-        # Attempt to post daily summary (Midnight Logic)
-        post_daily_stats(config, base, log_dir)
+        # Reset daily counters in state
+        status_vals['LastDailyReportDate'] = today_str
+        status_vals['DailyISPOutages'] = '0'
+        for h in hosts: 
+            status_vals[f'DailyDowntime_{h["Hostname"]}'] = '0'
 
-        outage_updates = []
-        tags = config.get('X_TAG_ACCOUNTS', '')
+    # ------------------------------------------
+    # B. PARALLEL PING EXECUTION
+    # ------------------------------------------
+    with ThreadPoolExecutor(max_workers=len(hosts) if hosts else 5) as executor:
+        current_results = dict(list(executor.map(ping_individual_host, hosts)))
 
-        # Loop through the 4 host slots
-        for i in range(1, 5):
-            ip = config.get(f'IP{i}')
-            host = config.get(f'Hostname{i}')
-            threshold = int(config.get(f'Threshold{i}', 2))
-            if not ip: continue
+    # ------------------------------------------
+    # C. ISP OUTAGE LOGIC
+    # ------------------------------------------
+    remote_hosts = [h for h in hosts if h.get('Location') == 'Remote']
+    remotes_all_down = all(current_results[h['Hostname']] == "Down" for h in remote_hosts)
+    gateway_up = current_results.get('Gateway') == "Up"
+    
+    # Detect ISP failure: Local Gateway is UP but ALL Remote hosts are DOWN
+    isp_active = gateway_up and len(remote_hosts) > 0 and remotes_all_down
+    was_isp_active = status_vals.get('ISP_Outage_Active', 'False') == 'True'
+    
+    outage_updates = []
 
-            # Previous known state
-            old_status = status_vals.get(f'Status{i}', 'Up')
-            old_time = status_vals.get(f'DateTime{i}', '0')
-            fail_count = int(status_vals.get(f'FailCount{i}', '0'))
+    # ------------------------------------------
+    # D. DATA PROCESSING & LOGGING
+    # ------------------------------------------
+    for h in hosts:
+        name = h['Hostname']
+        res = current_results[name]
+        old_status = status_vals.get(f'Status_{name}', 'Up')
+        old_time = status_vals.get(f'Time_{name}', timestamp)
+        fail_count = int(status_vals.get(f'Fail_{name}', '0'))
+        threshold = int(h.get('Threshold', 3))
 
-            # Execute system ping command (-c 1 for Linux, -n 1 for Windows)
-            param = '-n' if platform.system().lower() == 'windows' else '-c'
-            is_up = subprocess.call(['ping', param, '1', '-W', '1', ip], 
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
-            
-            result = "Up" if is_up else "Down"
+        # Write result to daily host-specific log
+        with open(os.path.join(log_dir, f"{name}-{now.strftime('%m%d%Y')}.txt"), "a") as f:
+            f.write(f"{timestamp}: {res}\n")
 
-            # Always log the raw result to the Host-Logs folder
-            log_path = os.path.join(log_dir, f"{host}-{date_str}.txt")
-            with open(log_path, "a") as hf:
-                hf.write(f"{timestamp}: {ip}: {result}\n")
-
-            # Logic for host failing
-            if result == "Down":
-                fail_count += 1
-                if fail_count == 1:
-                    status_vals[f'DateTime{i}'] = timestamp # Mark original fail time
+        if res == "Down":
+            fail_count += 1
+            if fail_count == 1: status_vals[f'Time_{name}'] = timestamp
+            # Update state to 'Down' only after threshold is crossed
+            if fail_count >= threshold: status_vals[f'Status_{name}'] = "Down"
+        else:
+            # Check if host just recovered from a 'Down' state
+            if old_status == "Down":
+                duration_mins = get_duration(old_time, now)
+                key = f'DailyDowntime_{name}'
+                status_vals[key] = str(int(status_vals.get(key, '0')) + duration_mins)
                 
-                # Check if threshold is reached to trigger an alert
-                if fail_count == threshold and old_status == "Up":
-                    status_vals[f'Status{i}'] = "Down"
-                    outage_updates.append(f"Alert: {host} DOWN at {status_vals[f'DateTime{i}']}")
-            
-            # Logic for host returning to service
-            else:
-                if old_status == "Down":
-                    outage_updates.append(f"Recovery: {host} UP. Outage: {old_time} to {timestamp}")
-                
-                status_vals[f'Status{i}'] = "Up"
-                status_vals[f'FailCount{i}'] = "0"
-                status_vals[f'DateTime{i}'] = timestamp # Use as heartbeat
+                # Suppress individual tweets during a general ISP outage
+                if not was_isp_active or h.get('Location') != 'Remote':
+                    outage_updates.append(f"✅ {name} Restored. Down: {duration_mins}m")
 
-            status_vals[f'FailCount{i}'] = str(fail_count)
+            status_vals[f'Status_{name}'] = "Up"
+            status_vals[f'Fail_{name}'] = "0"
+        
+        status_vals[f'Fail_{name}'] = str(fail_count)
 
-        # Send any collected alerts or recoveries to X
-        if outage_updates:
-            msg = f"Network Update {tags}:\n" + "\n".join(outage_updates)
-            try:
-                get_x_client(config).create_tweet(text=msg[:280])
-            except Exception as e:
-                log_error(f"Alert Tweet Failed: {e}", base)
+    # ISP Event Transitions
+    if was_isp_active and not isp_active and gateway_up:
+        isp_dur = get_duration(status_vals.get('ISP_Start_Time', timestamp), now)
+        outage_updates.append(f"🚨 ISP Outage Resolved\nDuration: {isp_dur}m")
+        status_vals['DailyISPOutages'] = str(int(status_vals.get('DailyISPOutages', '0')) + 1)
+        status_vals['ISP_Outage_Active'] = 'False'
 
-        # Persist the current state to status.csv for the next run
-        with open(status_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Field Name', 'Value'])
-            for key, val in status_vals.items():
-                writer.writerow([key, val])
+    if isp_active and not was_isp_active:
+        status_vals['ISP_Outage_Active'] = 'True'
+        status_vals['ISP_Start_Time'] = timestamp
 
-    except Exception as e:
-        log_error(f"Global Script Error: {e}", base)
+    # ------------------------------------------
+    # E. ALERTS & STATE PERSISTENCE
+    # ------------------------------------------
+    if daily_report_msg or outage_updates:
+        try:
+            tags = tw_cfg.get('X_TAG_ACCOUNTS', '')
+            client = tweepy.Client(
+                bearer_token=tw_cfg.get('BEARER_TOKEN'),
+                consumer_key=tw_cfg.get('API_KEY'),
+                consumer_secret=tw_cfg.get('API_SECRET'),
+                access_token=tw_cfg.get('ACCESS_TOKEN'),
+                access_token_secret=tw_cfg.get('ACCESS_TOKEN_SECRET')
+            )
+            # Post summary or individual alerts
+            if daily_report_msg: client.create_tweet(text=f"{daily_report_msg}\n{tags}"[:280])
+            for msg in outage_updates: client.create_tweet(text=f"{msg}\n{tags}"[:280])
+        except Exception as e:
+            # Log failures to root yearly error log
+            with open(error_file, "a", encoding='utf-8') as f:
+                f.write(f"{now}: Tweet Fail: {e}\n")
+
+    # Finalize state by writing back to status.csv
+    with open(status_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Field Name', 'Value'])
+        for k, v in status_vals.items(): writer.writerow([k, v])
 
 if __name__ == "__main__":
     main()
