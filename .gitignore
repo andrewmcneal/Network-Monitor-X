@@ -7,6 +7,7 @@ hosts-config.csv
 status.csv
 *.txt
 *.log
+.stats_sent_*
 Host-Logs/
 
 # Python environment
